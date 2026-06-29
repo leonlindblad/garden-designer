@@ -1,0 +1,133 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <meta name="theme-color" content="#2d5a3d">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="Garden Designer">
+  <title>Garden Designer</title>
+  <link rel="manifest" href="manifest.json">
+  <link rel="apple-touch-icon" href="icons/icon-192.png">
+  <link rel="icon" type="image/svg+xml" href="icons/icon.svg">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+  <!-- ============ SETUP SCREEN (no API key yet) ============ -->
+  <div id="setup-screen" class="screen">
+    <div class="setup-card">
+      <div class="logo">🌱</div>
+      <h1>Garden Designer</h1>
+      <p class="subtitle">Plan your garden on top of real satellite imagery.</p>
+      <p class="step">Enter your <strong>Google Maps API key</strong> to begin.</p>
+      <input type="password" id="api-key-input" class="text-input" placeholder="Paste your API key here" autocomplete="off">
+      <div class="row">
+        <input type="checkbox" id="remember-key" checked>
+        <label for="remember-key">Remember this device</label>
+      </div>
+      <button id="start-btn" class="btn btn-primary" disabled>Start designing</button>
+      <details class="help">
+        <summary>How do I get an API key?</summary>
+        <ol>
+          <li>Go to <a href="https://console.cloud.google.com/" target="_blank">Google Cloud Console</a>.</li>
+          <li>Create a project (or pick one).</li>
+          <li>Open <strong>APIs &amp; Services → Library</strong> and enable <strong>Maps JavaScript API</strong> and <strong>Geocoding API</strong>.</li>
+          <li>Go to <strong>Credentials → Create Credentials → API key</strong>.</li>
+          <li>(Recommended) Restrict the key to your website address + the two APIs above.</li>
+          <li>Paste the key above. It stays on your device only.</li>
+        </ol>
+        <p class="fineprint">Your key is stored locally in your browser and sent only to Google. It never touches our server (there is no server).</p>
+      </details>
+      <p class="privacy">🔒 Your key &amp; designs live only in this browser.</p>
+    </div>
+  </div>
+
+  <!-- ============ TOP BAR ============ -->
+  <header id="topbar" class="hidden">
+    <div class="topbar-left">
+      <span class="logo-sm">🌱</span>
+      <span class="title">Garden Designer</span>
+    </div>
+    <div class="topbar-right">
+      <button id="reframe-btn" class="btn btn-ghost" title="Re-frame the aerial view">🗺️ Re-frame</button>
+      <button id="undo-btn" class="btn btn-ghost" title="Undo (Ctrl+Z)">↩️</button>
+      <button id="redo-btn" class="btn btn-ghost" title="Redo (Ctrl+Y)">↪️</button>
+      <button id="save-btn" class="btn btn-ghost" title="Export design">💾</button>
+      <button id="menu-btn" class="btn btn-ghost" title="Menu">☰</button>
+    </div>
+  </header>
+
+  <!-- ============ FRAMING MODE ============ -->
+  <div id="framing-bar" class="hidden">
+    <div class="search-wrap">
+      <input type="text" id="address-input" class="text-input" placeholder="🔎 Search your address or postcode…">
+      <button id="search-btn" class="btn btn-primary">Find</button>
+    </div>
+    <p class="framing-hint">Pan &amp; zoom to frame your garden, then lock it as the plan background.</p>
+    <button id="lock-btn" class="btn btn-lock">🔒 Lock as background</button>
+  </div>
+
+  <!-- ============ MAP + DRAWING LAYER ============ -->
+  <div id="canvas-area">
+    <div id="map"></div>
+    <svg id="drawing-layer" xmlns="http://www.w3.org/2000/svg"></svg>
+    <div id="scale-bar" class="hidden">
+      <div class="scale-line"></div>
+      <span id="scale-label">5 m</span>
+    </div>
+    <div id="lock-overlay-hint" class="hidden">Tap the map once to unlock panning, or place an object from the panel.</div>
+  </div>
+
+  <!-- ============ PALETTE (bottom) ============ -->
+  <nav id="palette" class="hidden">
+    <div class="palette-tabs" id="palette-tabs"></div>
+    <div class="palette-items" id="palette-items"></div>
+  </nav>
+
+  <!-- ============ PROPERTIES PANEL (selected object) ============ -->
+  <aside id="props-panel" class="hidden">
+    <div class="props-header">
+      <span id="props-title">Object</span>
+      <button id="props-close" class="btn btn-ghost small">✕</button>
+    </div>
+    <div class="props-body">
+      <label>Width <input type="number" id="prop-w" step="0.1" min="0.1"> m</label>
+      <label>Height <input type="number" id="prop-h" step="0.1" min="0.1"> m</label>
+      <label>Rotation <input type="range" id="prop-rot" min="0" max="359"><span id="prop-rot-val">0°</span></label>
+      <label>Label <input type="text" id="prop-label" placeholder="optional name"></label>
+      <div class="props-actions">
+        <button id="prop-duplicate" class="btn btn-ghost">⧉ Duplicate</button>
+        <button id="prop-delete" class="btn btn-danger">🗑 Delete</button>
+      </div>
+    </div>
+  </aside>
+
+  <!-- ============ SAVE / MENU MODAL ============ -->
+  <div id="menu-modal" class="modal hidden">
+    <div class="modal-card">
+      <h2>Save &amp; Export</h2>
+      <p class="muted">Your design auto-saves to this browser as you work.</p>
+      <button id="export-json" class="btn btn-secondary">⬇️ Export design (JSON)</button>
+      <button id="export-png" class="btn btn-secondary">🖼️ Export image (PNG)</button>
+      <label class="file-btn">
+        ⬆️ Import design (JSON)
+        <input type="file" id="import-json" accept="application/json" hidden>
+      </label>
+      <hr>
+      <button id="new-design" class="btn btn-ghost">✨ Start new design</button>
+      <button id="clear-all" class="btn btn-ghost">🗑 Clear everything</button>
+      <button id="change-key" class="btn btn-ghost">🔑 Change API key</button>
+      <hr>
+      <div class="toggle-row">
+        <label><input type="checkbox" id="toggle-grid" checked> Snap to grid</label>
+        <label><input type="checkbox" id="toggle-labels" checked> Show labels</label>
+      </div>
+      <button id="menu-close" class="btn btn-primary full">Done</button>
+    </div>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
