@@ -162,6 +162,7 @@ function enterFraming(cb) {
   $('setup-screen').classList.add('hidden');
   $('topbar').classList.remove('hidden');
   $('framing-bar').classList.remove('hidden');
+  $('canvas-area').classList.add('visible');
   $('palette').classList.add('hidden');
   $('lock-overlay-hint').classList.add('hidden');
 
