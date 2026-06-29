@@ -26,6 +26,13 @@ html, body {
   -webkit-user-select: none;
 }
 
+/* Inputs must always allow select + paste (global user-select:none breaks paste on WebKit) */
+input, textarea {
+  user-select: text;
+  -webkit-user-select: text;
+  -webkit-user-modify: read-write;
+}
+
 .hidden { display: none !important; }
 
 /* ============ SETUP SCREEN ============ */
