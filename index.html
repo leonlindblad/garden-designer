@@ -128,6 +128,21 @@
     </div>
   </div>
 
+  <!-- Cache-buster: unregister any old service worker + clear caches so fixes always land -->
+  <script>
+    if ('serviceWorker' in navigator) {
+      window.addEventListener('load', () => {
+        navigator.serviceWorker.getRegistrations().then((regs) => {
+          regs.forEach((r) => r.unregister());
+          if (window.caches) {
+            caches.keys().then((keys) => keys.forEach((k) => caches.delete(k)));
+          }
+          // Now register the fresh, network-first service worker.
+          navigator.serviceWorker.register('sw.js').catch(() => {});
+        });
+      });
+    }
+  </script>
   <script src="app.js"></script>
 </body>
 </html>
