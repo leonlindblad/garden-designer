@@ -1,11 +1,14 @@
 'use strict';
 /* =====================================================================
    GARDEN DESIGNER — plan-mode garden planner
-   Architecture:
-     - Google Maps JS API provides live satellite (framing mode)
-     - "Lock" freezes the map; an SVG overlay becomes the drawing surface
-     - Objects are stored in LAT/LNG + meters, so they're anchored to reality
-     - metersPerPixel = 156543.03392 * cos(lat) / 2^zoom  → real scale
+   Base layers (all design at true metric scale):
+     - 'satellite' : Google Maps live aerial; objects anchored in lat/lng
+     - 'image'     : an uploaded photo/plan; scale set by calibration line
+     - 'blank'     : empty scaled grid sized to the plot
+   The drawing/selection code is base-agnostic: it only goes through
+   latLngToPx() / pxToLatLng() / metersPerPixel, which branch per base.
+   For image/blank, objects are stored in a flat "world" plane and the
+   view {tx,ty,scale} maps world units -> screen pixels.
    ===================================================================== */
 
 const $ = (id) => document.getElementById(id);
@@ -44,7 +47,7 @@ const CATALOG = {
       fence:    { name: 'Fence',      icon: '🚧', color: '#7a5c3a', shape: 'rect',      w: 5,   h: 0.3 },
       wall:     { name: 'Wall',       icon: '🧱', color: '#8a8a8a', shape: 'rect',      w: 5,   h: 0.4 },
       shed:     { name: 'Shed',       icon: '🏠', color: '#6b4226', shape: 'rect',      w: 3,   h: 2 },
-      greenhouse:{name: 'Greenhouse', icon: '植物园',color: '#7ec8a0',shape: 'rect',      w: 3,   h: 2 },
+      greenhouse:{name: 'Greenhouse', icon: '🪟',  color: '#7ec8a0', shape: 'rect',      w: 3,   h: 2 },
     }
   },
   water: {
@@ -77,13 +80,14 @@ for (const cat of Object.values(CATALOG)) for (const [k, v] of Object.entries(ca
 /* ---------- Global state ---------- */
 let apiKey = localStorage.getItem('gd_apikey') || '';
 let map = null;
-let overlay = null;        // OverlayView for projection access
-let mode = 'setup';        // setup | framing | draw
-let objects = [];          // {id,type,lat,lng,w,h,rot,label}
+let overlay = null;          // OverlayView for projection access
+let mode = 'setup';          // setup | framing | calibrate | draw
+let baseType = 'satellite';  // satellite | image | blank
+let objects = [];            // satellite: {lat,lng}; image/blank: {lat=worldY, lng=worldX}
 let selectedId = null;
-let placingType = null;    // when set, next click places this type
+let placingType = null;
 let metersPerPixel = 1;
-let mapCenter = null;      // {lat,lng}
+let mapCenter = null;
 let mapZoom = 20;
 let undoStack = [];
 let redoStack = [];
@@ -93,31 +97,130 @@ let currentTab = 'plants';
 let dragState = null;
 let renderQueued = false;
 
+/* image/blank base-layer state */
+let view = { tx: 0, ty: 0, scale: 40 };  // world-units -> screen px, + pan offset
+let bgDataUrl = null;                     // uploaded image (data URL)
+let bgImg = { w: 0, h: 0 };               // image size in world units (= pixels of stored image)
+let metersPerWorldUnit = 1;               // image: from calibration; blank: 1 (world unit = metre)
+let plot = { w: 20, h: 15 };              // blank plot size in metres
+let calib = null;                         // { p1:{x,y}, p2:{x,y} } in world units while calibrating
+let pendingFit = false;                   // fit view to plot once the canvas is visible
+
 /* ===================================================================== */
-/*  SETUP / API KEY                                                      */
+/*  SETUP / ENTRY                                                        */
 /* ===================================================================== */
 function init() {
+  // --- base-layer chooser ---
+  $('opt-image').addEventListener('click', () => $('bg-file').click());
+  $('opt-blank').addEventListener('click', () => showPanel('blank-panel'));
+  $('opt-satellite').addEventListener('click', () => {
+    showPanel('key-panel');
+    if (apiKey) { $('api-key-input').value = apiKey; $('start-btn').disabled = false; }
+  });
+  document.querySelectorAll('[data-back]').forEach((b) => b.addEventListener('click', showChooser));
+
+  // --- satellite key panel ---
   $('api-key-input').addEventListener('input', (e) => {
     $('start-btn').disabled = e.target.value.trim().length < 10;
   });
   $('start-btn').addEventListener('click', () => {
     apiKey = $('api-key-input').value.trim();
     if ($('remember-key').checked) localStorage.setItem('gd_apikey', apiKey);
-    else sessionStorage.setItem('gd_apikey', apiKey);
+    else { localStorage.removeItem('gd_apikey'); sessionStorage.setItem('gd_apikey', apiKey); }
+    baseType = 'satellite';
     enterFraming();
   });
 
-  if (apiKey) { $('api-key-input').value = apiKey; $('start-btn').disabled = false; }
-  // Auto-start if key exists + a design is saved
+  // --- blank panel ---
+  $('blank-start').addEventListener('click', () => {
+    plot.w = Math.max(1, parseFloat($('blank-w').value) || 20);
+    plot.h = Math.max(1, parseFloat($('blank-h').value) || 15);
+    startBlank();
+  });
+
+  // --- image upload ---
+  $('bg-file').addEventListener('change', (e) => { if (e.target.files[0]) loadBackgroundImage(e.target.files[0]); });
+
+  // --- calibration controls ---
+  $('calib-set').addEventListener('click', applyCalibration);
+  $('calib-redraw').addEventListener('click', resetCalibration);
+
+  // --- resume a saved design ---
   const saved = loadDesign();
-  if (apiKey && saved && saved.mapCenter) {
-    enterFraming(() => {
-      restoreDesign(saved);
-      if (saved.objects && saved.objects.length) enterDraw(false);
-    });
+  if (saved && saved.baseType) tryResume(saved);
+}
+
+function showPanel(id) {
+  $('base-chooser').classList.add('hidden');
+  ['key-panel', 'blank-panel'].forEach((p) => $(p).classList.toggle('hidden', p !== id));
+}
+function showChooser() {
+  $('base-chooser').classList.remove('hidden');
+  $('key-panel').classList.add('hidden');
+  $('blank-panel').classList.add('hidden');
+}
+
+function tryResume(saved) {
+  // Offer to pick up where the user left off (only if it can be reconstructed).
+  if (saved.baseType === 'satellite') {
+    if (apiKey && saved.mapCenter) {
+      baseType = 'satellite';
+      enterFraming(() => { restoreDesign(saved); if (saved.objects && saved.objects.length) enterDraw(false); });
+    }
+  } else if (saved.baseType === 'image' && saved.bgDataUrl) {
+    baseType = 'image';
+    bgDataUrl = saved.bgDataUrl;
+    bgImg = saved.bgImg || { w: 0, h: 0 };
+    metersPerWorldUnit = saved.metersPerWorldUnit || 1;
+    restoreDesign(saved);
+    enterDraw(false);
+  } else if (saved.baseType === 'blank') {
+    baseType = 'blank';
+    metersPerWorldUnit = 1;
+    plot = saved.plot || plot;
+    restoreDesign(saved);
+    enterDraw(false);
   }
 }
 
+/* ---------- image upload + downscale ---------- */
+function loadBackgroundImage(file) {
+  const reader = new FileReader();
+  reader.onload = () => {
+    const img = new Image();
+    img.onload = () => {
+      // Downscale very large photos so they fit localStorage and render fast.
+      const MAX = 2400;
+      let w = img.naturalWidth, h = img.naturalHeight;
+      if (Math.max(w, h) > MAX) { const k = MAX / Math.max(w, h); w = Math.round(w * k); h = Math.round(h * k); }
+      const cv = document.createElement('canvas');
+      cv.width = w; cv.height = h;
+      cv.getContext('2d').drawImage(img, 0, 0, w, h);
+      bgDataUrl = cv.toDataURL('image/jpeg', 0.85);
+      bgImg = { w, h };
+      baseType = 'image';
+      metersPerWorldUnit = 1;          // provisional until calibrated (world unit == image pixel)
+      objects = [];
+      enterCalibrate();
+    };
+    img.onerror = () => alert('Could not read that image. Try a JPG or PNG.');
+    img.src = reader.result;
+  };
+  reader.onerror = () => alert('Could not read that file.');
+  reader.readAsDataURL(file);
+}
+
+function startBlank() {
+  baseType = 'blank';
+  metersPerWorldUnit = 1;
+  objects = [];
+  pendingFit = true;     // fit the new plot once the canvas is on screen
+  enterDraw(false);
+}
+
+/* ===================================================================== */
+/*  GOOGLE MAPS (satellite)                                              */
+/* ===================================================================== */
 function loadGoogleMaps(cb) {
   if (window.google && window.google.maps) { cb(); return; }
   const s = document.createElement('script');
@@ -127,9 +230,6 @@ function loadGoogleMaps(cb) {
   document.head.appendChild(s);
 }
 
-/* ===================================================================== */
-/*  PROJECTION OVERLAY                                                   */
-/* ===================================================================== */
 // Defined lazily: google.maps.OverlayView only exists after the Maps script
 // loads. Referencing it at top-level parse time would throw and kill the app.
 let ProjectionOverlay = null;
@@ -144,26 +244,58 @@ function createOverlay(map) {
   }
   return new ProjectionOverlay(map);
 }
+function proj() { return overlay && overlay.getProjection(); }
 
-function proj() { return overlay.getProjection(); }
+/* ===================================================================== */
+/*  PROJECTION (base-agnostic)                                           */
+/*    latLngToPx / pxToLatLng switch on baseType. For image/blank the    */
+/*    stored "lat" is world-Y and "lng" is world-X (both world units).   */
+/* ===================================================================== */
+function worldToScreen(wx, wy) { return { x: wx * view.scale + view.tx, y: wy * view.scale + view.ty }; }
+function screenToWorld(sx, sy) { return { x: (sx - view.tx) / view.scale, y: (sy - view.ty) / view.scale }; }
+
 function latLngToPx(lat, lng) {
-  const p = proj();
-  if (!p) return { x: 0, y: 0 };
-  const px = p.fromLatLngToContainerPixel(new google.maps.LatLng(lat, lng));
-  return { x: px.x, y: px.y };
+  if (baseType === 'satellite') {
+    const p = proj();
+    if (!p) return { x: 0, y: 0 };
+    const px = p.fromLatLngToContainerPixel(new google.maps.LatLng(lat, lng));
+    return { x: px.x, y: px.y };
+  }
+  return worldToScreen(lng, lat);   // lng = world X, lat = world Y
 }
 function pxToLatLng(x, y) {
-  const p = proj();
-  if (!p) return null;
-  return p.fromContainerPixelToLatLng(new google.maps.Point(x, y));
+  if (baseType === 'satellite') {
+    const p = proj();
+    if (!p) return null;
+    return p.fromContainerPixelToLatLng(new google.maps.Point(x, y));
+  }
+  // mimic google.maps.LatLng shape so shared drag code works unchanged
+  const w = screenToWorld(x, y);
+  return { lat: () => w.y, lng: () => w.x };
 }
 function computeMetersPerPixel() {
-  const lat = mapCenter ? mapCenter.lat : 0;
-  return 156543.03392 * Math.cos((lat * Math.PI) / 180) / Math.pow(2, mapZoom);
+  if (baseType === 'satellite') {
+    const lat = mapCenter ? mapCenter.lat : 0;
+    return 156543.03392 * Math.cos((lat * Math.PI) / 180) / Math.pow(2, mapZoom);
+  }
+  return metersPerWorldUnit / view.scale;
+}
+
+/* fit the image / plot into the visible canvas */
+function fitView() {
+  const r = $('canvas-area').getBoundingClientRect();
+  let cw, ch;
+  if (baseType === 'image') { cw = bgImg.w; ch = bgImg.h; }
+  else { cw = plot.w; ch = plot.h; }                  // blank: world unit == metre
+  if (!cw || !ch) { view = { tx: 0, ty: 0, scale: 40 }; return; }
+  const pad = 0.9;
+  view.scale = Math.min(r.width / cw, r.height / ch) * pad;
+  view.tx = (r.width - cw * view.scale) / 2;
+  view.ty = (r.height - ch * view.scale) / 2;
 }
 
 /* ===================================================================== */
-/*  FRAMING MODE                                                         */
+/*  FRAMING MODE (satellite)                                             */
 /* ===================================================================== */
 function enterFraming(cb) {
   mode = 'framing';
@@ -171,9 +303,12 @@ function enterFraming(cb) {
   $('setup-screen').classList.add('hidden');
   $('topbar').classList.remove('hidden');
   $('framing-bar').classList.remove('hidden');
+  $('calibrate-bar').classList.add('hidden');
   $('canvas-area').classList.add('visible');
   $('palette').classList.add('hidden');
   $('lock-overlay-hint').classList.add('hidden');
+  $('reframe-btn').classList.remove('hidden');
+  $('map').style.display = '';
 
   const startMap = () => {
     if (!map) {
@@ -189,8 +324,7 @@ function enterFraming(cb) {
       overlay = createOverlay(map);
       map.addListener('bounds_changed', () => queueRender());
       map.addListener('idle', () => { mapCenter = { lat: map.getCenter().lat(), lng: map.getCenter().lng() }; mapZoom = map.getZoom(); metersPerPixel = computeMetersPerPixel(); updateScaleBar(); queueRender(); });
-      // defer callback until projection ready
-      google.maps.event.addListenerOnce(map, 'idle', () => setTimeout(cb, 50));
+      google.maps.event.addListenerOnce(map, 'idle', () => setTimeout(() => cb && cb(), 50));
     } else {
       enableMapInteraction(true);
       if (cb) cb();
@@ -219,7 +353,6 @@ function bindFramingUI() {
   $('search-btn').onclick = doSearch;
   $('address-input').onkeydown = (e) => { if (e.key === 'Enter') doSearch(); };
   $('lock-btn').onclick = () => enterDraw(true);
-  $('reframe-btn').onclick = () => { selectedId = null; renderObjects(); enterFraming(); };
 }
 
 function enableMapInteraction(on) {
@@ -235,23 +368,83 @@ function enableMapInteraction(on) {
 }
 
 /* ===================================================================== */
-/*  DRAW MODE (locked)                                                   */
+/*  CALIBRATION MODE (image)                                             */
+/* ===================================================================== */
+function enterCalibrate() {
+  mode = 'calibrate';
+  calib = null;
+  $('setup-screen').classList.add('hidden');
+  $('topbar').classList.remove('hidden');
+  $('framing-bar').classList.add('hidden');
+  $('calibrate-bar').classList.remove('hidden');
+  $('canvas-area').classList.add('visible');
+  $('palette').classList.add('hidden');
+  $('scale-bar').classList.add('hidden');
+  $('reframe-btn').classList.add('hidden');
+  $('map').style.display = 'none';              // image lives in the SVG, not the Google map
+  $('drawing-layer').classList.add('draw-mode');
+  resetCalibration();
+  fitView();
+  renderObjects();
+}
+
+function resetCalibration() {
+  calib = null;
+  $('calib-instr').textContent = '📏 Draw a line over something you know the length of — a fence, wall, or the house. Tap two points on the image.';
+  $('calib-input-wrap').style.display = 'none';
+  $('calib-redraw').style.display = 'none';
+  renderObjects();
+}
+
+function applyCalibration() {
+  if (!calib || !calib.p2) return;
+  const m = parseFloat($('calib-len').value);
+  if (!m || m <= 0) { alert('Enter the real length of the line in metres.'); return; }
+  const dist = Math.hypot(calib.p2.x - calib.p1.x, calib.p2.y - calib.p1.y); // world units
+  if (dist < 1) { alert('That line is too short to measure — draw a longer one.'); return; }
+  metersPerWorldUnit = m / dist;
+  calib = null;
+  enterDraw(false);
+}
+
+/* ===================================================================== */
+/*  DRAW MODE                                                            */
 /* ===================================================================== */
 function enterDraw(lock) {
   mode = 'draw';
-  if (lock) {
-    mapCenter = { lat: map.getCenter().lat(), lng: map.getCenter().lng() };
-    mapZoom = map.getZoom();
-    enableMapInteraction(false);
+  if (baseType === 'satellite') {
+    if (lock) {
+      mapCenter = { lat: map.getCenter().lat(), lng: map.getCenter().lng() };
+      mapZoom = map.getZoom();
+      enableMapInteraction(false);
+    }
+    $('map').style.display = '';
+    $('reframe-btn').classList.remove('hidden');
+  } else {
+    $('map').style.display = 'none';
+    $('reframe-btn').classList.add('hidden');
   }
+  $('setup-screen').classList.add('hidden');
+  $('topbar').classList.remove('hidden');
+  $('canvas-area').classList.add('visible');
   $('framing-bar').classList.add('hidden');
+  $('calibrate-bar').classList.add('hidden');
   $('palette').classList.remove('hidden');
   $('scale-bar').classList.remove('hidden');
-  $('drawing-layer').classList.add('draw-mode');   // overlay now captures clicks for drawing
+  $('drawing-layer').classList.add('draw-mode');   // overlay captures clicks for drawing
+  if (baseType !== 'satellite' && pendingFit) { fitView(); pendingFit = false; }
   metersPerPixel = computeMetersPerPixel();
   updateScaleBar();
   renderObjects();
   saveDesign();
+}
+
+/* "Re-frame / Fit" button */
+function reframe() {
+  selectedId = null;
+  $('props-panel').classList.add('hidden');
+  if (baseType === 'satellite') { renderObjects(); enterFraming(); }
+  else { fitView(); metersPerPixel = computeMetersPerPixel(); updateScaleBar(); renderObjects(); }
 }
 
 /* ===================================================================== */
@@ -283,10 +476,9 @@ function buildPalette() {
 function startPlacing(typeKey) {
   placingType = typeKey;
   $('drawing-layer').classList.add('placing');
-  // visual hint via title flash
   const hint = document.createElement('div');
   hint.id = 'place-hint';
-  hint.textContent = `👆 Tap on the map to place ${TYPES[typeKey].name}`;
+  hint.textContent = `👆 Tap to place ${TYPES[typeKey].name}`;
   hint.style.cssText = 'position:fixed;top:70px;left:50%;transform:translateX(-50%);background:var(--accent);color:#0e1f12;padding:8px 16px;border-radius:20px;font-weight:600;font-size:14px;z-index:150;box-shadow:var(--shadow)';
   document.body.appendChild(hint);
 }
@@ -308,11 +500,29 @@ function queueRender() {
 
 function renderObjects() {
   const svg = $('drawing-layer');
-  // size svg to container
   const r = $('canvas-area').getBoundingClientRect();
   svg.setAttribute('viewBox', `0 0 ${r.width} ${r.height}`);
   svg.innerHTML = '';
 
+  // ---- background (image / blank grid) ----
+  if (baseType === 'image' && bgDataUrl) {
+    const tl = worldToScreen(0, 0);
+    const w = bgImg.w * view.scale, h = bgImg.h * view.scale;
+    svg.appendChild(el('image', { href: bgDataUrl, x: tl.x, y: tl.y, width: w, height: h, preserveAspectRatio: 'none' }));
+  } else if (baseType === 'blank') {
+    svg.appendChild(renderGrid(r));
+  }
+
+  // ---- calibration line ----
+  if (mode === 'calibrate' && calib && calib.p1) {
+    const a = worldToScreen(calib.p1.x, calib.p1.y);
+    const b = calib.p2 ? worldToScreen(calib.p2.x, calib.p2.y) : a;
+    svg.appendChild(el('line', { x1: a.x, y1: a.y, x2: b.x, y2: b.y, stroke: 'var(--accent)', 'stroke-width': 3, 'stroke-linecap': 'round' }));
+    for (const p of [a, calib.p2 ? b : null]) if (p) svg.appendChild(el('circle', { cx: p.x, cy: p.y, r: 6, fill: 'var(--accent)', stroke: '#fff', 'stroke-width': 2 }));
+    return; // no objects while calibrating
+  }
+
+  // ---- objects ----
   for (const o of objects) {
     const t = TYPES[o.type];
     const { x, y } = latLngToPx(o.lat, o.lng);
@@ -326,29 +536,46 @@ function renderObjects() {
   }
 }
 
+function renderGrid(r) {
+  // 1-metre grid covering the plot, with a highlighted plot boundary.
+  const g = el('g', {});
+  const o = worldToScreen(0, 0);
+  const far = worldToScreen(plot.w, plot.h);
+  g.appendChild(el('rect', { x: o.x, y: o.y, width: far.x - o.x, height: far.y - o.y, fill: '#223', 'fill-opacity': 0.35 }));
+  const stepPx = view.scale; // 1 world unit (metre) in px
+  if (stepPx >= 6) {
+    for (let mx = 0; mx <= plot.w + 0.001; mx++) {
+      const a = worldToScreen(mx, 0), b = worldToScreen(mx, plot.h);
+      g.appendChild(el('line', { x1: a.x, y1: a.y, x2: b.x, y2: b.y, class: 'grid-line' }));
+    }
+    for (let my = 0; my <= plot.h + 0.001; my++) {
+      const a = worldToScreen(0, my), b = worldToScreen(plot.w, my);
+      g.appendChild(el('line', { x1: a.x, y1: a.y, x2: b.x, y2: b.y, class: 'grid-line' }));
+    }
+  }
+  g.appendChild(el('rect', { x: o.x, y: o.y, width: far.x - o.x, height: far.y - o.y, fill: 'none', stroke: 'var(--accent)', 'stroke-width': 2 }));
+  return g;
+}
+
 function renderShape(t, w, h) {
   const wrap = el('g', {});
   const style = `fill:${t.color};fill-opacity:0.78;stroke:${shade(t.color, -30)};stroke-width:1.5`;
   if (t.shape === 'circle') {
     const r = Math.min(w, h) / 2;
     wrap.appendChild(el('circle', { cx: 0, cy: 0, r, style }));
-    // inner texture ring for trees
     wrap.appendChild(el('circle', { cx: 0, cy: 0, r: r * 0.6, fill: 'none', stroke: shade(t.color, 20), 'stroke-width': 1, 'stroke-opacity': 0.5 }));
   } else if (t.shape === 'roundrect') {
     wrap.appendChild(el('rect', { x: -w / 2, y: -h / 2, width: w, height: h, rx: Math.min(w, h) * 0.15, style }));
   } else if (t.shape === 'rect') {
     wrap.appendChild(el('rect', { x: -w / 2, y: -h / 2, width: w, height: h, style }));
   } else if (t.shape === 'blob') {
-    // pond organic shape
     wrap.appendChild(el('path', { d: blobPath(w, h), style }));
   }
-  // icon emoji centered
   wrap.appendChild(el('text', { 'text-anchor': 'middle', 'dominant-baseline': 'central', 'font-size': Math.min(w, h) * 0.5, y: 0 }, t.icon.length > 2 ? '' : t.icon));
   return wrap;
 }
 
 function blobPath(w, h) {
-  // simple irregular closed curve
   const a = w / 2, b = h / 2;
   return `M ${-a * 0.8} ${-b} C ${a} ${-b*1.1}, ${a*1.1} ${b*0.5}, ${a*0.4} ${b} C ${-a*1.05} ${b*1.05}, ${-a*1.1} ${-b*0.3}, ${-a*0.8} ${-b} Z`;
 }
@@ -356,10 +583,8 @@ function blobPath(w, h) {
 function renderSelection(w, h) {
   const g = el('g', { class: 'sel' });
   g.appendChild(el('rect', { class: 'selection-box', x: -w / 2 - 6, y: -h / 2 - 6, width: w + 12, height: h + 12, rx: 4 }));
-  // corner resize handles
   const corners = [[-w/2-6,-h/2-6],[w/2+6,-h/2-6],[w/2+6,h/2+6],[-w/2-6,h/2+6]];
   for (const [cx,cy] of corners) g.appendChild(el('rect', { class:'handle', x:cx-5, y:cy-5, width:10, height:10, rx:2, 'data-handle':'resize' }));
-  // rotate handle above top edge
   g.appendChild(el('line', { x1:0, y1:-h/2-6, x2:0, y2:-h/2-28, stroke:'var(--accent)','stroke-width':1.5,'stroke-dasharray':'3 2' }));
   g.appendChild(el('circle', { class:'handle rot', cx:0, cy:-h/2-30, r:7, 'data-handle':'rotate' }));
   return g;
@@ -391,9 +616,40 @@ function svgPoint(e) {
 function bindCanvas() {
   const svg = $('drawing-layer');
   svg.addEventListener('pointerdown', onPointerDown);
+  svg.addEventListener('wheel', onWheel, { passive: false });
+}
+
+function onWheel(e) {
+  if (baseType === 'satellite' || (mode !== 'draw' && mode !== 'calibrate')) return;
+  e.preventDefault();
+  const pt = svgPoint(e);
+  const before = screenToWorld(pt.x, pt.y);
+  const factor = e.deltaY < 0 ? 1.12 : 1 / 1.12;
+  view.scale = Math.max(2, Math.min(4000, view.scale * factor));
+  view.tx = pt.x - before.x * view.scale;
+  view.ty = pt.y - before.y * view.scale;
+  metersPerPixel = computeMetersPerPixel();
+  updateScaleBar();
+  renderObjects();
 }
 
 function onPointerDown(e) {
+  // ---- calibration: two taps define the reference line ----
+  if (mode === 'calibrate') {
+    const sp = svgPoint(e);
+    const w = screenToWorld(sp.x, sp.y);
+    if (!calib || calib.p2) { calib = { p1: w, p2: null }; }
+    else {
+      calib.p2 = w;
+      $('calib-instr').textContent = 'Now type how long that line is in real life:';
+      $('calib-input-wrap').style.display = 'flex';
+      $('calib-redraw').style.display = 'inline-flex';
+      setTimeout(() => $('calib-len').focus(), 0);
+    }
+    renderObjects();
+    return;
+  }
+
   if (mode !== 'draw') return;
   const pt = svgPoint(e);
   const target = e.target;
@@ -433,18 +689,33 @@ function onPointerDown(e) {
     return;
   }
 
-  // empty space → deselect / cancel placing
+  // empty space
   if (placingType) { cancelPlacing(); return; }
   selectedId = null;
   $('props-panel').classList.add('hidden');
+
+  // for image/blank, dragging empty space pans the view
+  if (baseType !== 'satellite') {
+    dragState = { type: 'pan', startPt: pt, startTx: view.tx, startTy: view.ty };
+    window.addEventListener('pointermove', onPointerMove);
+    window.addEventListener('pointerup', onPointerUp);
+  }
   renderObjects();
 }
 
 function onPointerMove(e) {
   if (!dragState) return;
+  const pt = svgPoint(e);
+
+  if (dragState.type === 'pan') {
+    view.tx = dragState.startTx + (pt.x - dragState.startPt.x);
+    view.ty = dragState.startTy + (pt.y - dragState.startPt.y);
+    renderObjects();
+    return;
+  }
+
   const o = objects.find(x => x.id === dragState.id);
   if (!o) return;
-  const pt = svgPoint(e);
 
   if (dragState.type === 'move') {
     const ll = pxToLatLng(pt.x, pt.y);
@@ -462,22 +733,26 @@ function onPointerMove(e) {
     o.h = Math.max(0.2, dragState.startH * scale);
   } else if (dragState.type === 'rotate') {
     const cx = dragState.cx;
-    const ang = Math.atan2(pt.y - cyOffset(0), pt.x - cx.x) * 180 / Math.PI;
+    const ang = Math.atan2(pt.y - cx.y, pt.x - cx.x) * 180 / Math.PI;
     const startAng = Math.atan2(dragState.startPt.y - cx.y, dragState.startPt.x - cx.x) * 180 / Math.PI;
     o.rot = (dragState.startRot + (ang - startAng) + 360) % 360;
   }
   renderObjects(); syncProps();
 }
-function cyOffset() { return 0; }
 
 function onPointerUp() {
-  if (dragState) { pushHistory(); saveDesign(); }
+  if (dragState && dragState.type !== 'pan') { pushHistory(); saveDesign(); }
   dragState = null;
   window.removeEventListener('pointermove', onPointerMove);
   window.removeEventListener('pointerup', onPointerUp);
 }
 
-function roundGrid(v) { return Math.round(v * 10000) / 10000; }
+function roundGrid(v) {
+  if (baseType === 'satellite') return Math.round(v * 10000) / 10000;
+  // snap world coords to 0.25 m
+  const stepWorld = 0.25 / metersPerWorldUnit;
+  return Math.round(v / stepWorld) * stepWorld;
+}
 
 function makeObject(type, lat, lng) {
   const t = TYPES[type];
@@ -509,7 +784,7 @@ function bindProps() {
   $('prop-w').onchange = () => pushHistory();
   $('prop-h').onchange = () => pushHistory();
   $('props-close').onclick = () => { selectedId = null; $('props-panel').classList.add('hidden'); renderObjects(); };
-  $('prop-duplicate').onclick = () => { const o = objects.find(x => x.id === selectedId); if (o) { pushHistory(); const n = { ...o, id: 'o'+Date.now(), lat: o.lat + 0.00005, lng: o.lng + 0.00005 }; objects.push(n); selectedId = n.id; renderObjects(); syncProps(); saveDesign(); } };
+  $('prop-duplicate').onclick = () => { const o = objects.find(x => x.id === selectedId); if (o) { pushHistory(); const off = baseType === 'satellite' ? 0.00005 : 0.5 / metersPerWorldUnit; const n = { ...o, id: 'o'+Date.now(), lat: o.lat + off, lng: o.lng + off }; objects.push(n); selectedId = n.id; renderObjects(); syncProps(); saveDesign(); } };
   $('prop-delete').onclick = deleteSelected;
 }
 
@@ -528,8 +803,17 @@ function deleteSelected() {
 let saveTimer = null;
 function saveDebounced() { clearTimeout(saveTimer); saveTimer = setTimeout(saveDesign, 400); }
 function saveDesign() {
-  const data = { mapCenter, mapZoom, objects, snapGrid, showLabels, savedAt: Date.now() };
-  localStorage.setItem('gd_design', JSON.stringify(data));
+  const data = {
+    baseType, objects, snapGrid, showLabels, savedAt: Date.now(),
+    mapCenter, mapZoom,
+    view, metersPerWorldUnit, plot, bgImg,
+    bgDataUrl: baseType === 'image' ? bgDataUrl : null,
+  };
+  try { localStorage.setItem('gd_design', JSON.stringify(data)); }
+  catch (e) {
+    // Most likely the image pushed us over quota — save without it.
+    try { localStorage.setItem('gd_design', JSON.stringify({ ...data, bgDataUrl: null })); } catch (_) {}
+  }
 }
 function loadDesign() {
   try { return JSON.parse(localStorage.getItem('gd_design')); } catch { return null; }
@@ -541,6 +825,10 @@ function restoreDesign(d) {
   showLabels = d.showLabels !== false;
   if (d.mapCenter) mapCenter = d.mapCenter;
   if (d.mapZoom) mapZoom = d.mapZoom;
+  if (d.view) view = d.view;
+  if (d.metersPerWorldUnit) metersPerWorldUnit = d.metersPerWorldUnit;
+  if (d.plot) plot = d.plot;
+  if (d.bgImg) bgImg = d.bgImg;
   $('toggle-grid').checked = snapGrid;
   $('toggle-labels').checked = showLabels;
 }
@@ -556,7 +844,6 @@ function redo() { if (!redoStack.length) return; undoStack.push(JSON.stringify(o
 /*  SCALE BAR                                                            */
 /* ===================================================================== */
 function updateScaleBar() {
-  // pick a "nice" round distance near 80px
   const targetPx = 80;
   const targetM = targetPx * metersPerPixel;
   const nice = niceNumber(targetM);
@@ -577,7 +864,7 @@ function niceNumber(x) {
 /*  EXPORT / IMPORT                                                      */
 /* ===================================================================== */
 function exportJSON() {
-  const data = { mapCenter, mapZoom, objects, version: 1 };
+  const data = { baseType, mapCenter, mapZoom, objects, view, metersPerWorldUnit, plot, bgImg, bgDataUrl, version: 2 };
   download('garden-design.json', JSON.stringify(data, null, 2), 'application/json');
 }
 function importJSON(file) {
@@ -587,43 +874,52 @@ function importJSON(file) {
       const d = JSON.parse(reader.result);
       if (!d.objects) throw new Error('bad file');
       pushHistory();
+      baseType = d.baseType || 'satellite';
+      if (d.bgDataUrl) bgDataUrl = d.bgDataUrl;
       restoreDesign(d);
-      if (d.mapCenter) map.setCenter(d.mapCenter);
-      if (d.mapZoom) map.setZoom(d.mapZoom);
+      if (baseType === 'satellite' && map) { if (d.mapCenter) map.setCenter(d.mapCenter); if (d.mapZoom) map.setZoom(d.mapZoom); }
       enterDraw(false);
-      renderObjects();
       saveDesign();
     } catch (e) { alert('Could not import: ' + e.message); }
   };
   reader.readAsText(file);
 }
+
 function exportPNG() {
-  // Compose: satellite snapshot (via Static Maps) + SVG overlay → canvas
   const r = $('canvas-area').getBoundingClientRect();
   const w = Math.round(r.width), h = Math.round(r.height);
+
+  if (baseType !== 'satellite') {
+    // The SVG already contains the background image / grid + objects — just rasterise it.
+    rasterizeOverlay(w, h, null);
+    return;
+  }
+  // satellite: fetch a static aerial at the same framing, then overlay the SVG
   const lat = mapCenter.lat, lng = mapCenter.lng;
-  // static map at same zoom & size — note max size 640, scale 2
   const s = Math.min(w, 1280);
   const url = `https://maps.googleapis.com/maps/api/staticmap?center=${lat},${lng}&zoom=${mapZoom}&size=${s}x${Math.round(s*h/w)}&maptype=satellite&key=${encodeURIComponent(apiKey)}`;
   const img = new Image();
   img.crossOrigin = 'anonymous';
-  img.onload = () => {
-    const cv = document.createElement('canvas');
-    cv.width = w; cv.height = h;
-    const ctx = cv.getContext('2d');
-    ctx.drawImage(img, 0, 0, w, h);
-    // serialize SVG overlay
-    const svg = $('drawing-layer').cloneNode(true);
-    svg.setAttribute('width', w); svg.setAttribute('height', h);
-    const xml = new XMLSerializer().serializeToString(svg);
-    const svgImg = new Image();
-    svgImg.onload = () => { ctx.drawImage(svgImg, 0, 0, w, h); cv.toBlob(b => downloadBlob(b, 'garden-plan.png'), 'image/png'); };
-    svgImg.onerror = () => { alert('Could not render overlay.'); };
-    svgImg.src = 'data:image/svg+xml;base64,' + btoa(unescape(encodeURIComponent(xml)));
-  };
+  img.onload = () => rasterizeOverlay(w, h, img);
   img.onerror = () => alert('Could not fetch satellite image. Check your API key has Static Maps API enabled.');
   img.src = url;
 }
+
+function rasterizeOverlay(w, h, bgImage) {
+  const cv = document.createElement('canvas');
+  cv.width = w; cv.height = h;
+  const ctx = cv.getContext('2d');
+  ctx.fillStyle = '#1a1f1c'; ctx.fillRect(0, 0, w, h);
+  if (bgImage) ctx.drawImage(bgImage, 0, 0, w, h);
+  const svg = $('drawing-layer').cloneNode(true);
+  svg.setAttribute('width', w); svg.setAttribute('height', h);
+  const xml = new XMLSerializer().serializeToString(svg);
+  const svgImg = new Image();
+  svgImg.onload = () => { ctx.drawImage(svgImg, 0, 0, w, h); cv.toBlob(b => downloadBlob(b, 'garden-plan.png'), 'image/png'); };
+  svgImg.onerror = () => { alert('Could not render the overlay.'); };
+  svgImg.src = 'data:image/svg+xml;base64,' + btoa(unescape(encodeURIComponent(xml)));
+}
+
 function download(name, content, type) {
   const blob = new Blob([content], { type });
   downloadBlob(blob, name);
@@ -644,13 +940,14 @@ function bindMenu() {
   $('export-json').onclick = exportJSON;
   $('export-png').onclick = exportPNG;
   $('import-json').onchange = (e) => { if (e.target.files[0]) importJSON(e.target.files[0]); };
-  $('new-design').onclick = () => { if (confirm('Start a new design? This clears the current plan.')) { pushHistory(); objects = []; selectedId = null; $('props-panel').classList.add('hidden'); $('menu-modal').classList.add('hidden'); enterFraming(); } };
+  $('new-design').onclick = () => { if (confirm('Start a new design? This clears the current plan and returns to the start screen.')) { objects = []; selectedId = null; bgDataUrl = null; $('props-panel').classList.add('hidden'); $('menu-modal').classList.add('hidden'); location.reload(); } };
   $('clear-all').onclick = () => { if (confirm('Delete everything?')) { pushHistory(); objects = []; selectedId = null; renderObjects(); saveDesign(); $('menu-modal').classList.add('hidden'); } };
   $('change-key').onclick = () => { if (confirm('Remove saved API key and go to setup?')) { localStorage.removeItem('gd_apikey'); sessionStorage.removeItem('gd_apikey'); location.reload(); } };
   $('toggle-grid').onchange = (e) => { snapGrid = e.target.checked; };
   $('toggle-labels').onchange = (e) => { showLabels = e.target.checked; renderObjects(); saveDesign(); };
   $('undo-btn').onclick = undo;
   $('redo-btn').onclick = redo;
+  $('reframe-btn').onclick = reframe;
 
   document.addEventListener('keydown', (e) => {
     if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
@@ -675,8 +972,6 @@ function boot() {
   bindMenu();
   window.addEventListener('resize', () => queueRender());
 }
-// Run now if DOM is ready, otherwise wait — app.js sits at end of <body>,
-// so DOM is usually already parsed by the time we execute.
 if (document.readyState === 'loading') {
   document.addEventListener('DOMContentLoaded', boot);
 } else {

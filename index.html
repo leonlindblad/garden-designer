@@ -11,36 +11,74 @@
   <link rel="manifest" href="manifest.json">
   <link rel="apple-touch-icon" href="icons/icon-192.png">
   <link rel="icon" type="image/svg+xml" href="icons/icon.svg">
-  <link rel="stylesheet" href="style.css?v=3">
+  <link rel="stylesheet" href="style.css?v=4">
 </head>
 <body>
 
-  <!-- ============ SETUP SCREEN (no API key yet) ============ -->
+  <!-- ============ SETUP SCREEN ============ -->
   <div id="setup-screen" class="screen">
     <div class="setup-card">
       <div class="logo">🌱</div>
       <h1>Garden Designer</h1>
-      <p class="subtitle">Plan your garden on top of real satellite imagery.</p>
-      <p class="step">Enter your <strong>Google Maps API key</strong> to begin.</p>
-      <input type="password" id="api-key-input" class="text-input" placeholder="Paste your API key here" autocomplete="off">
-      <div class="row">
-        <input type="checkbox" id="remember-key" checked>
-        <label for="remember-key">Remember this device</label>
+      <p class="subtitle">Plan your garden at true scale.</p>
+
+      <!-- STEP 1 — choose a base layer -->
+      <div id="base-chooser">
+        <p class="step">How do you want to start?</p>
+        <button class="base-opt" id="opt-image">
+          <span class="be">📷</span>
+          <span class="bt"><strong>Upload a photo or plan</strong><small>Drone shot, photo from a window, or a site plan. Sharp, current, nothing hidden. Recommended.</small></span>
+        </button>
+        <button class="base-opt" id="opt-blank">
+          <span class="be">📐</span>
+          <span class="bt"><strong>Blank canvas</strong><small>Just enter your plot size and design on a scaled grid.</small></span>
+        </button>
+        <button class="base-opt" id="opt-satellite">
+          <span class="be">🛰️</span>
+          <span class="bt"><strong>Google satellite</strong><small>Trace over live aerial imagery (needs a Google Maps key).</small></span>
+        </button>
       </div>
-      <button id="start-btn" class="btn btn-primary" disabled>Start designing</button>
-      <details class="help">
-        <summary>How do I get an API key?</summary>
-        <ol>
-          <li>Go to <a href="https://console.cloud.google.com/" target="_blank">Google Cloud Console</a>.</li>
-          <li>Create a project (or pick one).</li>
-          <li>Open <strong>APIs &amp; Services → Library</strong> and enable <strong>Maps JavaScript API</strong> and <strong>Geocoding API</strong>.</li>
-          <li>Go to <strong>Credentials → Create Credentials → API key</strong>.</li>
-          <li>(Recommended) Restrict the key to your website address + the two APIs above.</li>
-          <li>Paste the key above. It stays on your device only.</li>
-        </ol>
-        <p class="fineprint">Your key is stored locally in your browser and sent only to Google. It never touches our server (there is no server).</p>
-      </details>
-      <p class="privacy">🔒 Your key &amp; designs live only in this browser.</p>
+
+      <!-- STEP 2a — API key (satellite only) -->
+      <div id="key-panel" class="sub-panel hidden">
+        <p class="step">Enter your <strong>Google Maps API key</strong>.</p>
+        <input type="password" id="api-key-input" class="text-input" placeholder="Paste your API key here" autocomplete="off">
+        <div class="row">
+          <input type="checkbox" id="remember-key" checked>
+          <label for="remember-key">Remember this device</label>
+        </div>
+        <button id="start-btn" class="btn btn-primary full" disabled>Start designing</button>
+        <details class="help">
+          <summary>How do I get an API key?</summary>
+          <ol>
+            <li>Go to <a href="https://console.cloud.google.com/" target="_blank">Google Cloud Console</a>.</li>
+            <li>Create a project (or pick one).</li>
+            <li>Open <strong>APIs &amp; Services → Library</strong> and enable <strong>Maps JavaScript API</strong> and <strong>Geocoding API</strong>.</li>
+            <li>Go to <strong>Credentials → Create Credentials → API key</strong>.</li>
+            <li>(Recommended) Restrict the key to your website address + the two APIs above.</li>
+            <li>Paste the key above. It stays on your device only.</li>
+          </ol>
+          <p class="fineprint">Your key is stored locally in your browser and sent only to Google. It never touches our server (there is no server).</p>
+        </details>
+        <button class="link-back" data-back>← Back</button>
+      </div>
+
+      <!-- STEP 2b — blank canvas dimensions -->
+      <div id="blank-panel" class="sub-panel hidden">
+        <p class="step">Roughly how big is your plot?</p>
+        <div class="dim-row">
+          <label>Width <input type="number" id="blank-w" value="20" min="1" step="0.5"> m</label>
+          <label>Depth <input type="number" id="blank-h" value="15" min="1" step="0.5"> m</label>
+        </div>
+        <p class="fineprint">You can change this any time — it just sets the starting grid.</p>
+        <button id="blank-start" class="btn btn-primary full">Start designing</button>
+        <button class="link-back" data-back>← Back</button>
+      </div>
+
+      <!-- hidden file picker for image upload -->
+      <input type="file" id="bg-file" accept="image/*" hidden>
+
+      <p class="privacy">🔒 Everything stays in this browser.</p>
     </div>
   </div>
 
@@ -67,6 +105,16 @@
     </div>
     <p class="framing-hint">Pan &amp; zoom to frame your garden, then lock it as the plan background.</p>
     <button id="lock-btn" class="btn btn-lock">🔒 Lock as background</button>
+  </div>
+
+  <!-- ============ CALIBRATION BAR (image mode) ============ -->
+  <div id="calibrate-bar" class="hidden">
+    <p class="framing-hint" id="calib-instr">📏 Draw a line over something you know the length of — a fence, wall, or the house. Tap two points on the image.</p>
+    <div class="search-wrap" id="calib-input-wrap" style="display:none">
+      <label class="calib-len-label">Real length <input type="number" id="calib-len" class="text-input" step="0.1" min="0.1" placeholder="e.g. 9.5"> m</label>
+      <button id="calib-set" class="btn btn-primary">Set scale</button>
+    </div>
+    <button id="calib-redraw" class="btn btn-ghost" style="display:none">↺ Redraw line</button>
   </div>
 
   <!-- ============ MAP + DRAWING LAYER ============ -->
@@ -143,6 +191,6 @@
       });
     }
   </script>
-  <script src="app.js?v=3"></script>
+  <script src="app.js?v=4"></script>
 </body>
 </html>
