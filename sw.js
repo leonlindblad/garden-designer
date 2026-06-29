@@ -1,7 +1,7 @@
 // Service Worker — offline-ready PWA shell.
 // Strategy: network-first for the app shell (so updates always reach the user),
 // cache-only as the offline fallback. The map tiles need network anyway (Google).
-const CACHE = 'garden-designer-v3';
+const CACHE = 'garden-designer-v4';
 const ASSETS = [
   './',
   './index.html',

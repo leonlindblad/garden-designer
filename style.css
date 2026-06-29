@@ -126,7 +126,11 @@ input, textarea {
 #drawing-layer {
   position: absolute; inset: 0; width: 100%; height: 100%;
   cursor: crosshair; overflow: visible; touch-action: none;
+  /* In framing mode the map must receive pan/zoom gestures, so the overlay
+     stays click-through until we lock the background and enter draw mode. */
+  pointer-events: none;
 }
+#drawing-layer.draw-mode { pointer-events: auto; }
 #drawing-layer.placing { cursor: copy; }
 
 #scale-bar {

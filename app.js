@@ -167,6 +167,7 @@ function computeMetersPerPixel() {
 /* ===================================================================== */
 function enterFraming(cb) {
   mode = 'framing';
+  $('drawing-layer').classList.remove('draw-mode');  // let the map receive pan/zoom while framing
   $('setup-screen').classList.add('hidden');
   $('topbar').classList.remove('hidden');
   $('framing-bar').classList.remove('hidden');
@@ -246,6 +247,7 @@ function enterDraw(lock) {
   $('framing-bar').classList.add('hidden');
   $('palette').classList.remove('hidden');
   $('scale-bar').classList.remove('hidden');
+  $('drawing-layer').classList.add('draw-mode');   // overlay now captures clicks for drawing
   metersPerPixel = computeMetersPerPixel();
   updateScaleBar();
   renderObjects();
