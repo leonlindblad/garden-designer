@@ -130,11 +130,19 @@ function loadGoogleMaps(cb) {
 /* ===================================================================== */
 /*  PROJECTION OVERLAY                                                   */
 /* ===================================================================== */
-class ProjectionOverlay extends google.maps.OverlayView {
-  constructor(map) { super(); this.setMap(map); }
-  draw() {}
-  onAdd() {}
-  onRemove() {}
+// Defined lazily: google.maps.OverlayView only exists after the Maps script
+// loads. Referencing it at top-level parse time would throw and kill the app.
+let ProjectionOverlay = null;
+function createOverlay(map) {
+  if (!ProjectionOverlay) {
+    ProjectionOverlay = class extends google.maps.OverlayView {
+      constructor(map) { super(); this.setMap(map); }
+      draw() {}
+      onAdd() {}
+      onRemove() {}
+    };
+  }
+  return new ProjectionOverlay(map);
 }
 
 function proj() { return overlay.getProjection(); }
@@ -177,7 +185,7 @@ function enterFraming(cb) {
         streetViewControl: false,
         fullscreenControl: false,
       });
-      overlay = new ProjectionOverlay(map);
+      overlay = createOverlay(map);
       map.addListener('bounds_changed', () => queueRender());
       map.addListener('idle', () => { mapCenter = { lat: map.getCenter().lat(), lng: map.getCenter().lng() }; mapZoom = map.getZoom(); metersPerPixel = computeMetersPerPixel(); updateScaleBar(); queueRender(); });
       // defer callback until projection ready
