@@ -11,7 +11,7 @@
   <link rel="manifest" href="manifest.json">
   <link rel="apple-touch-icon" href="icons/icon-192.png">
   <link rel="icon" type="image/svg+xml" href="icons/icon.svg">
-  <link rel="stylesheet" href="style.css?v=4">
+  <link rel="stylesheet" href="style.css?v=5">
 </head>
 <body>
 
@@ -28,6 +28,10 @@
         <button class="base-opt" id="opt-image">
           <span class="be">📷</span>
           <span class="bt"><strong>Upload a photo or plan</strong><small>Drone shot, photo from a window, or a site plan. Sharp, current, nothing hidden. Recommended.</small></span>
+        </button>
+        <button class="base-opt" id="opt-rectify">
+          <span class="be">🪟</span>
+          <span class="bt"><strong>Straighten an angled photo</strong><small>Photo from a window or an angle — flatten it to top-down using a rectangle you can measure.</small></span>
         </button>
         <button class="base-opt" id="opt-blank">
           <span class="be">📐</span>
@@ -117,6 +121,16 @@
     <button id="calib-redraw" class="btn btn-ghost" style="display:none">↺ Redraw line</button>
   </div>
 
+  <!-- ============ RECTIFY BAR (straighten angled photo) ============ -->
+  <div id="rectify-bar" class="hidden">
+    <p class="framing-hint">🪟 Drag the 4 dots onto the corners of a rectangle you can measure — a patio, lawn, or the house. Order: ① top-left → ② top-right → ③ bottom-right → ④ bottom-left.</p>
+    <div class="search-wrap">
+      <label class="calib-len-label">Width <input type="number" id="rect-w" class="text-input" step="0.1" min="0.1" placeholder="e.g. 6"> m</label>
+      <label class="calib-len-label">Depth <input type="number" id="rect-h" class="text-input" step="0.1" min="0.1" placeholder="e.g. 4"> m</label>
+      <button id="rect-go" class="btn btn-primary">Straighten &amp; use</button>
+    </div>
+  </div>
+
   <!-- ============ MAP + DRAWING LAYER ============ -->
   <div id="canvas-area">
     <div id="map"></div>
@@ -191,6 +205,6 @@
       });
     }
   </script>
-  <script src="app.js?v=4"></script>
+  <script src="app.js?v=5"></script>
 </body>
 </html>

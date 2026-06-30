@@ -105,13 +105,16 @@ let metersPerWorldUnit = 1;               // image: from calibration; blank: 1 (
 let plot = { w: 20, h: 15 };              // blank plot size in metres
 let calib = null;                         // { p1:{x,y}, p2:{x,y} } in world units while calibrating
 let pendingFit = false;                   // fit view to plot once the canvas is visible
+let uploadIntent = 'calibrate';           // what to do after an image upload: 'calibrate' | 'rectify'
+let rectPts = null;                        // 4 corner points (world units) while straightening a photo
 
 /* ===================================================================== */
 /*  SETUP / ENTRY                                                        */
 /* ===================================================================== */
 function init() {
   // --- base-layer chooser ---
-  $('opt-image').addEventListener('click', () => $('bg-file').click());
+  $('opt-image').addEventListener('click', () => { uploadIntent = 'calibrate'; $('bg-file').value = ''; $('bg-file').click(); });
+  $('opt-rectify').addEventListener('click', () => { uploadIntent = 'rectify'; $('bg-file').value = ''; $('bg-file').click(); });
   $('opt-blank').addEventListener('click', () => showPanel('blank-panel'));
   $('opt-satellite').addEventListener('click', () => {
     showPanel('key-panel');
@@ -144,6 +147,9 @@ function init() {
   // --- calibration controls ---
   $('calib-set').addEventListener('click', applyCalibration);
   $('calib-redraw').addEventListener('click', resetCalibration);
+
+  // --- rectify controls ---
+  $('rect-go').addEventListener('click', applyRectify);
 
   // --- resume a saved design ---
   const saved = loadDesign();
@@ -201,7 +207,8 @@ function loadBackgroundImage(file) {
       baseType = 'image';
       metersPerWorldUnit = 1;          // provisional until calibrated (world unit == image pixel)
       objects = [];
-      enterCalibrate();
+      if (uploadIntent === 'rectify') enterRectify();
+      else enterCalibrate();
     };
     img.onerror = () => alert('Could not read that image. Try a JPG or PNG.');
     img.src = reader.result;
@@ -408,6 +415,125 @@ function applyCalibration() {
 }
 
 /* ===================================================================== */
+/*  RECTIFY MODE (straighten an angled photo via a homography)           */
+/* ===================================================================== */
+function enterRectify() {
+  mode = 'rectify';
+  $('setup-screen').classList.add('hidden');
+  $('topbar').classList.remove('hidden');
+  $('framing-bar').classList.add('hidden');
+  $('calibrate-bar').classList.add('hidden');
+  $('rectify-bar').classList.remove('hidden');
+  $('canvas-area').classList.add('visible');
+  $('palette').classList.add('hidden');
+  $('scale-bar').classList.add('hidden');
+  $('reframe-btn').classList.add('hidden');
+  $('map').style.display = 'none';
+  $('drawing-layer').classList.add('draw-mode');
+  // default quad: an inset rectangle the user drags onto a real one
+  rectPts = [
+    { x: bgImg.w * 0.30, y: bgImg.h * 0.35 },
+    { x: bgImg.w * 0.70, y: bgImg.h * 0.35 },
+    { x: bgImg.w * 0.78, y: bgImg.h * 0.72 },
+    { x: bgImg.w * 0.22, y: bgImg.h * 0.72 },
+  ];
+  fitView();
+  renderObjects();
+}
+
+function applyRectify() {
+  const realW = parseFloat($('rect-w').value);
+  const realH = parseFloat($('rect-h').value);
+  if (!realW || !realH || realW <= 0 || realH <= 0) { alert('Enter the real width and depth of the rectangle in metres.'); return; }
+
+  // Output raster sized to the real rectangle, capped on the long side.
+  const MAX = 1400;
+  const pxPerM = MAX / Math.max(realW, realH);
+  const outW = Math.max(2, Math.round(realW * pxPerM));
+  const outH = Math.max(2, Math.round(realH * pxPerM));
+  const dst = [{ x: 0, y: 0 }, { x: outW, y: 0 }, { x: outW, y: outH }, { x: 0, y: outH }];
+
+  // Reverse map: for each output pixel, find the source pixel (homography dst -> src).
+  const H = solveHomography(dst, rectPts);
+  if (!H) { alert('Could not compute the perspective — make sure the 4 dots form a proper quadrilateral.'); return; }
+
+  const srcImg = new Image();
+  srcImg.onload = () => {
+    const sc = document.createElement('canvas'); sc.width = bgImg.w; sc.height = bgImg.h;
+    const sctx = sc.getContext('2d'); sctx.drawImage(srcImg, 0, 0, bgImg.w, bgImg.h);
+    const src = sctx.getImageData(0, 0, bgImg.w, bgImg.h).data;
+
+    const oc = document.createElement('canvas'); oc.width = outW; oc.height = outH;
+    const octx = oc.getContext('2d');
+    const out = octx.createImageData(outW, outH);
+    const od = out.data, sw = bgImg.w, sh = bgImg.h;
+    for (let Y = 0; Y < outH; Y++) {
+      for (let X = 0; X < outW; X++) {
+        const den = H[6] * X + H[7] * Y + 1;
+        const sx = (H[0] * X + H[1] * Y + H[2]) / den;
+        const sy = (H[3] * X + H[4] * Y + H[5]) / den;
+        const o = (Y * outW + X) * 4;
+        if (sx >= 0 && sx < sw - 1 && sy >= 0 && sy < sh - 1) {
+          // bilinear sample
+          const x0 = sx | 0, y0 = sy | 0, fx = sx - x0, fy = sy - y0;
+          const i00 = (y0 * sw + x0) * 4, i10 = i00 + 4, i01 = i00 + sw * 4, i11 = i01 + 4;
+          for (let k = 0; k < 3; k++) {
+            const top = src[i00 + k] * (1 - fx) + src[i10 + k] * fx;
+            const bot = src[i01 + k] * (1 - fx) + src[i11 + k] * fx;
+            od[o + k] = top * (1 - fy) + bot * fy;
+          }
+          od[o + 3] = 255;
+        } else { od[o + 3] = 0; }
+      }
+    }
+    octx.putImageData(out, 0, 0);
+
+    bgDataUrl = oc.toDataURL('image/jpeg', 0.85);
+    bgImg = { w: outW, h: outH };
+    metersPerWorldUnit = realW / outW;   // metres per output pixel (world unit)
+    baseType = 'image';
+    rectPts = null;
+    objects = [];
+    pendingFit = true;
+    enterDraw(false);
+  };
+  srcImg.onerror = () => alert('Could not process the image.');
+  srcImg.src = bgDataUrl;
+}
+
+/* Solve the projective transform mapping from[4] -> to[4].
+   Returns [a,b,c,d,e,f,g,h] for:  u=(ax+by+c)/(gx+hy+1), v=(dx+ey+f)/(gx+hy+1). */
+function solveHomography(from, to) {
+  const A = [], bvec = [];
+  for (let i = 0; i < 4; i++) {
+    const { x, y } = from[i], { x: u, y: v } = to[i];
+    A.push([x, y, 1, 0, 0, 0, -x * u, -y * u]); bvec.push(u);
+    A.push([0, 0, 0, x, y, 1, -x * v, -y * v]); bvec.push(v);
+  }
+  return gaussSolve(A, bvec);
+}
+
+/* Gaussian elimination with partial pivoting for an 8x8 system. */
+function gaussSolve(A, b) {
+  const n = b.length;
+  const M = A.map((row, i) => [...row, b[i]]);
+  for (let col = 0; col < n; col++) {
+    let piv = col;
+    for (let r = col + 1; r < n; r++) if (Math.abs(M[r][col]) > Math.abs(M[piv][col])) piv = r;
+    if (Math.abs(M[piv][col]) < 1e-9) return null;
+    [M[col], M[piv]] = [M[piv], M[col]];
+    const d = M[col][col];
+    for (let k = col; k <= n; k++) M[col][k] /= d;
+    for (let r = 0; r < n; r++) {
+      if (r === col) continue;
+      const f = M[r][col];
+      for (let k = col; k <= n; k++) M[r][k] -= f * M[col][k];
+    }
+  }
+  return M.map(row => row[n]);
+}
+
+/* ===================================================================== */
 /*  DRAW MODE                                                            */
 /* ===================================================================== */
 function enterDraw(lock) {
@@ -511,6 +637,17 @@ function renderObjects() {
     svg.appendChild(el('image', { href: bgDataUrl, x: tl.x, y: tl.y, width: w, height: h, preserveAspectRatio: 'none' }));
   } else if (baseType === 'blank') {
     svg.appendChild(renderGrid(r));
+  }
+
+  // ---- rectify: draggable corner quad ----
+  if (mode === 'rectify' && rectPts) {
+    const pts = rectPts.map(p => worldToScreen(p.x, p.y));
+    svg.appendChild(el('polygon', { class: 'rect-poly', points: pts.map(p => `${p.x},${p.y}`).join(' ') }));
+    pts.forEach((p, i) => {
+      svg.appendChild(el('circle', { class: 'rect-handle', cx: p.x, cy: p.y, r: 11, 'data-rectpt': i }));
+      svg.appendChild(el('text', { class: 'rect-num', x: p.x, y: p.y }, String(i + 1)));
+    });
+    return;
   }
 
   // ---- calibration line ----
@@ -620,7 +757,7 @@ function bindCanvas() {
 }
 
 function onWheel(e) {
-  if (baseType === 'satellite' || (mode !== 'draw' && mode !== 'calibrate')) return;
+  if (baseType === 'satellite' || (mode !== 'draw' && mode !== 'calibrate' && mode !== 'rectify')) return;
   e.preventDefault();
   const pt = svgPoint(e);
   const before = screenToWorld(pt.x, pt.y);
@@ -647,6 +784,20 @@ function onPointerDown(e) {
       setTimeout(() => $('calib-len').focus(), 0);
     }
     renderObjects();
+    return;
+  }
+
+  // ---- rectify: drag a corner marker, or pan empty space ----
+  if (mode === 'rectify') {
+    const pt = svgPoint(e);
+    const idAttr = e.target.getAttribute && e.target.getAttribute('data-rectpt');
+    if (idAttr != null) {
+      dragState = { type: 'rectpt', index: +idAttr };
+    } else {
+      dragState = { type: 'pan', startPt: pt, startTx: view.tx, startTy: view.ty };
+    }
+    window.addEventListener('pointermove', onPointerMove);
+    window.addEventListener('pointerup', onPointerUp);
     return;
   }
 
@@ -714,6 +865,12 @@ function onPointerMove(e) {
     return;
   }
 
+  if (dragState.type === 'rectpt') {
+    rectPts[dragState.index] = screenToWorld(pt.x, pt.y);
+    renderObjects();
+    return;
+  }
+
   const o = objects.find(x => x.id === dragState.id);
   if (!o) return;
 
@@ -741,7 +898,7 @@ function onPointerMove(e) {
 }
 
 function onPointerUp() {
-  if (dragState && dragState.type !== 'pan') { pushHistory(); saveDesign(); }
+  if (dragState && (dragState.type === 'move' || dragState.type === 'resize' || dragState.type === 'rotate')) { pushHistory(); saveDesign(); }
   dragState = null;
   window.removeEventListener('pointermove', onPointerMove);
   window.removeEventListener('pointerup', onPointerUp);
